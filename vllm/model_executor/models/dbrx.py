@@ -4,12 +4,15 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+import enum
+from enum import Enum
+
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
-from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.layers.fused_moe import fused_moe, quant_fused_moe
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear,
@@ -27,6 +30,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+from vllm import _custom_ops as ops
+
+class ExllamaState(Enum):
+
+    UNUSED = enum.auto()
+    UNINITIALIZED = enum.auto()
+    READY = enum.auto()
 
 class DbrxRouter(nn.Module):
     """A Router implementation for DBRX that returns logits for each expert
@@ -163,13 +173,37 @@ class DbrxExperts(nn.Module):
         router_logits = self.router(hidden_states)
         
         if self.use_fused_gptq_moe:
-            final_hidden_states = self.ws.quant_method.apply_moe_weights(
-                self.ws,
-                self.w2s,
+            # shuffle weights for exllama
+            for w in [self.ws, self.w2s]:
+                if w.exllama_state == ExllamaState.UNINITIALIZED:
+                    if self.quant_config.desc_act:
+                        w.g_idx.data[:] = torch.argsort(w.g_idx.data[:],
+                                                dim=-1).to(torch.int)
+                    else:
+                        w.g_idx.data[:] = torch.arange(
+                            w.g_idx.data.shape[1], device=w.g_idx.device).unsqueeze(0).repeat(
+                                w.g_idx.data.shape[0], 1)
+                    w.exllama_state = ExllamaState.READY
+                    ops.gptq_shuffle(w.qweight, w.g_idx,
+                                    self.quant_config.weight_bits)
+
+            # For memory bound workloads: decode and small prefills, use the
+            # fused quant moe. Otherwise, dequantize them individually
+            
+            final_hidden_states = quant_fused_moe(
                 hidden_states,
+                self.ws.qweight,
+                self.ws.scales,
+                self.ws.qzeros,
+                self.ws.g_idx,
+                self.w2s.qweight,
+                self.w2s.scales,
+                self.w2s.qzeros,
+                self.w2s.g_idx,
                 router_logits,
                 self.top_k,
-                renormalize=True,
+                True,
+                self.quant_config.weight_bits,
             )
         else:
             final_hidden_states = fused_moe(
