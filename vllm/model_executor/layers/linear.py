@@ -59,6 +59,28 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def create_moe_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype, num_experts: int, **extra_weight_attrs):
+        """Creating moe weights"""
+        self.create_weights(layer, input_size_per_partition,
+                                             output_partition_sizes,
+                                             input_size, output_size,
+                                             params_dtype, **extra_weight_attrs)
+        if num_experts == 1:
+            return
+        layer_param_dict = dict(layer.named_parameters())
+        print(layer_param_dict.keys())
+        for name, param in layer_param_dict.items():
+            print(type(param))
+            # param = getattr(layer, name, None)
+            if isinstance(param, Parameter):
+                repeat_size = (num_experts, ) + (1, ) * param.dim()
+                new_param = Parameter(param.unsqueeze(0).repeat(*repeat_size),
+                                      requires_grad=False)
+                set_weight_attrs(new_param, param.__dict__)
+                layer.register_parameter(name, new_param)
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization.
@@ -214,7 +236,8 @@ class ColumnParallelLinear(LinearBase):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 output_sizes: Optional[List[int]] = None):
+                 output_sizes: Optional[List[int]] = None,
+                 num_experts: int = 1):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config)
 
@@ -234,14 +257,16 @@ class ColumnParallelLinear(LinearBase):
 
         if output_sizes is None:
             output_sizes = [output_size]
-        self.quant_method.create_weights(
+        self.num_experts = num_experts
+        self.quant_method.create_moe_weights(
             layer=self,
             input_size_per_partition=self.input_size,
             output_partition_sizes=self.output_partition_sizes,
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
-            weight_loader=self.weight_loader)
+            num_experts=self.num_experts,
+            weight_loader=self.weight_loader,)
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
@@ -326,7 +351,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                  gather_output: bool = False,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 num_experts: int = 1):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
@@ -336,14 +362,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          gather_output=gather_output,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         num_experts=num_experts)
 
     def weight_loader(self,
                       param: Parameter,
                       loaded_weight: torch.Tensor,
-                      loaded_shard_id: Optional[int] = None):
+                      loaded_shard_id: Optional[int] = None,
+                      expert_id: int = 0):
 
         param_data = param.data
+        if self.num_experts > 1:
+            param_data = param_data[expert_id]
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
         is_metadata = getattr(param, "is_metadata", False)
@@ -693,7 +723,8 @@ class RowParallelLinear(LinearBase):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  reduce_results: bool = True,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 num_experts: int = 1):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config)
 
@@ -704,13 +735,15 @@ class RowParallelLinear(LinearBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
-        self.quant_method.create_weights(
+        self.num_experts = num_experts
+        self.quant_method.create_moe_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=[self.output_size],
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
+            num_experts=self.num_experts,
             weight_loader=self.weight_loader)
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
@@ -726,7 +759,7 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, expert_id: int = 0):
         # Special case for Fp8 scales.
         fp8_scales_shard_indexer = getattr(param, "fp8_scales_shard_indexer",
                                            None)
@@ -734,9 +767,12 @@ class RowParallelLinear(LinearBase):
         tp_rank = get_tensor_model_parallel_rank()
         input_dim = getattr(param, "input_dim", None)
         param_data = param.data
+        if self.num_experts > 1:
+            param_data = param_data[expert_id]
         if input_dim is not None:
             shard_size = param_data.shape[input_dim]
             start_idx = tp_rank * shard_size
+            print('Input dim: ', input_dim ,'start idx: ', start_idx, loaded_weight.shape, param_data.shape)
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
                                                  shard_size)
 

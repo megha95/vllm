@@ -11,7 +11,7 @@ from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.utils import set_weight_attrs
-
+from vllm.model_executor.layers.fused_moe import quant_fused_moe
 
 class GPTQConfig(QuantizationConfig):
     """Config class for GPTQ.
@@ -222,3 +222,39 @@ class GPTQLinearMethod(LinearMethodBase):
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
+
+    def apply_moe_weights(self, w1: torch.nn.Module, w2: torch.nn.Module,
+                          x: torch.Tensor, gating_output: torch.Tensor,
+                          topk: int, renormalize: bool) -> torch.Tensor:
+        # shuffle weights for exllama
+        for w in [w1, w2]:
+            if w.exllama_state == ExllamaState.UNINITIALIZED:
+                if self.quant_config.desc_act:
+                    w.g_idx.data[:] = torch.argsort(w.g_idx.data[:],
+                                               dim=-1).to(torch.int)
+                else:
+                    w.g_idx.data[:] = torch.arange(
+                         w.g_idx.data.shape[1], device=w.g_idx.device).unsqueeze(0).repeat(
+                            w.g_idx.data.shape[0], 1)
+                w.exllama_state = ExllamaState.READY
+                ops.gptq_shuffle(w.qweight, w.g_idx,
+                                 self.quant_config.weight_bits)
+
+        # For memory bound workloads: decode and small prefills, use the
+        # fused quant moe. Otherwise, dequantize them individually
+        
+        return quant_fused_moe(
+            x,
+            w1["qweight"],
+            w1["scales"],
+            w1["qzeros"],
+            w1["g_idx"],
+            w2["qweight"],
+            w2["scales"],
+            w2["qzeros"],
+            w2["g_idx"],
+            gating_output,
+            topk,
+            renormalize,
+            self.quant_config.weight_bits,
+        )
