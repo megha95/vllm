@@ -71,9 +71,7 @@ class LinearMethodBase(QuantizeMethodBase):
         if num_experts == 1:
             return
         layer_param_dict = dict(layer.named_parameters())
-        print(layer_param_dict.keys())
         for name, param in layer_param_dict.items():
-            print(type(param))
             # param = getattr(layer, name, None)
             if isinstance(param, Parameter):
                 repeat_size = (num_experts, ) + (1, ) * param.dim()
@@ -772,7 +770,6 @@ class RowParallelLinear(LinearBase):
         if input_dim is not None:
             shard_size = param_data.shape[input_dim]
             start_idx = tp_rank * shard_size
-            print('Input dim: ', input_dim ,'start idx: ', start_idx, loaded_weight.shape, param_data.shape)
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
                                                  shard_size)
 

@@ -12,7 +12,8 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
-                                               RowParallelLinear)
+                                               RowParallelLinear,
+                                               MergedColumnParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -25,7 +26,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
-
+from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 
 class DbrxRouter(nn.Module):
     """A Router implementation for DBRX that returns logits for each expert
@@ -81,35 +82,50 @@ class DbrxExperts(nn.Module):
         self.params_dtype = params_dtype
 
         self.router = DbrxRouter(config, self.params_dtype)
-        self.ws = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                2 * self.intermediate_size,
-                self.d_model,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
-        self.w2s = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                self.d_model,
-                self.intermediate_size,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
+        self.quant_config = quant_config
+        self.use_fused_gptq_moe = isinstance(quant_config, GPTQConfig)
+        if self.use_fused_gptq_moe:
+            self.intermediate_size = config.ffn_config.ffn_hidden_size
+            self.ws = MergedColumnParallelLinear(
+                    self.d_model, [self.intermediate_size] * 2,
+                                    bias=False,
+                                    quant_config=quant_config,
+                                    num_experts=self.num_total_experts)
+            self.w2s = RowParallelLinear(self.intermediate_size,
+                                    self.d_model,
+                                    bias=False,
+                                    quant_config=quant_config,
+                                    num_experts=self.num_total_experts)
+        else:
+            self.ws = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    2 * self.intermediate_size,
+                    self.d_model,
+                    device="cuda",
+                    dtype=self.params_dtype,
+                ))
+            self.w2s = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    self.d_model,
+                    self.intermediate_size,
+                    device="cuda",
+                    dtype=self.params_dtype,
+                ))
 
-        set_weight_attrs(
-            self.ws,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-        set_weight_attrs(
-            self.w2s,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
+            set_weight_attrs(
+                self.ws,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+            set_weight_attrs(
+                self.w2s,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str):
@@ -145,15 +161,26 @@ class DbrxExperts(nn.Module):
         hidden_states = hidden_states.view(-1, self.d_model)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            router_logits,
-            self.top_k,
-            renormalize=True,
-            inplace=True,
-        )
+        
+        if self.use_fused_gptq_moe:
+            final_hidden_states = self.ws.quant_method.apply_moe_weights(
+                self.ws,
+                self.w2s,
+                hidden_states,
+                router_logits,
+                self.top_k,
+                renormalize=True,
+            )
+        else:
+            final_hidden_states = fused_moe(
+                hidden_states,
+                self.ws,
+                self.w2s,
+                router_logits,
+                self.top_k,
+                renormalize=True,
+                inplace=True,
+            )
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
@@ -167,7 +194,6 @@ class DbrxAttention(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
-        cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -222,7 +248,6 @@ class DbrxAttention(nn.Module):
                               self.head_dim,
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
                               quant_config=quant_config)
 
     def forward(
@@ -285,7 +310,7 @@ class DbrxBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.norm_attn_norm = DbrxFusedNormAttention(config, cache_config,
+        self.norm_attn_norm = DbrxFusedNormAttention(config,
                                                      quant_config)
         self.ffn = DbrxExperts(config, quant_config)
 
@@ -362,6 +387,7 @@ class DbrxForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.use_fused_gptq_moe = isinstance(quant_config, GPTQConfig)
         self.unpadded_vocab_size = config.vocab_size
         self.transformer = DbrxModel(config, cache_config, quant_config)
         self.lm_head = ParallelLMHead(
@@ -400,22 +426,58 @@ class DbrxForCausalLM(nn.Module):
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        expert_params_mapping = [(
-            "ws" if weight_name in ["w1", "v1"] else "w2s",
-            f"experts.mlp.{weight_name}",
-        ) for weight_name in ["w1", "v1", "w2"]]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            for param_name, weight_name in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, weight_name)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+        if not self.use_fused_gptq_moe:
+            expert_params_mapping = [(
+                "ws" if weight_name in ["w1", "v1"] else "w2s",
+                f"experts.mlp.{weight_name}",
+            ) for weight_name in ["w1", "v1", "w2"]]
+            for name, loaded_weight in weights:
+                for param_name, weight_name in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, weight_name)
+                    break
+                else:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+        else:
+            expert_params_mapping = [
+                ("ws" if weight_name in ["w1", "v1"] else "w2s",
+                f"experts.mlp.{weight_name}", shard_id)
+                for weight_name, shard_id in [("w1", 0), ("v1", 1), ("w2", None)]
+            ]
+            for name, loaded_weight in weights:
+                for (param_name, weight_name, shard_id) in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    expert_id = int(name.split(".")[-2].split("_")[1])
+                    name = name.replace(weight_name + f"_{expert_id}", param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    if shard_id is None:
+                        weight_loader(param, loaded_weight, expert_id=expert_id)
+                    else:
+                        weight_loader(param,
+                                    loaded_weight,
+                                    shard_id,
+                                    expert_id=expert_id)
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip experts that are not assigned to this worker.
+                    if ("ffn.experts.mlp." in name and name not in params_dict):
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
