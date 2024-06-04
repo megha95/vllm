@@ -197,6 +197,27 @@ class GPTQLinearMethod(LinearMethodBase):
 
         layer.exllama_state = exllama_state
 
+    def create_moe_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype, num_experts: int, **extra_weight_attrs):
+        """Creating moe weights"""
+        self.create_weights(layer, input_size_per_partition,
+                                             output_partition_sizes,
+                                             input_size, output_size,
+                                             params_dtype, **extra_weight_attrs)
+        if num_experts == 1:
+            return
+        layer_param_dict = dict(layer.named_parameters())
+        for name, param in layer_param_dict.items():
+            # param = getattr(layer, name, None)
+            if isinstance(param, Parameter):
+                repeat_size = (num_experts, ) + (1, ) * param.dim()
+                new_param = Parameter(param.unsqueeze(0).repeat(*repeat_size),
+                                      requires_grad=False)
+                set_weight_attrs(new_param, param.__dict__)
+                layer.register_parameter(name, new_param)
+
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,

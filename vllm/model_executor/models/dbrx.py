@@ -9,11 +9,12 @@ from enum import Enum
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import fused_moe, quant_fused_moe
-from vllm.model_executor.layers.linear import (QKVParallelLinear,
+from vllm.model_executor.layers.linear import (adjust_marlin_shard,
+                                               QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear,
                                                MergedColumnParallelLinear)
@@ -96,16 +97,31 @@ class DbrxExperts(nn.Module):
         self.use_fused_gptq_moe = isinstance(quant_config, GPTQConfig)
         if self.use_fused_gptq_moe:
             self.intermediate_size = config.ffn_config.ffn_hidden_size
-            self.ws = MergedColumnParallelLinear(
-                    self.d_model, [self.intermediate_size] * 2,
+            self.output_sizes = [self.intermediate_size] * 2
+            self.ws = ReplicatedLinear(
+                    self.d_model, divide(self.intermediate_size * 2, self.tp_size),
                                     bias=False,
-                                    quant_config=quant_config,
-                                    num_experts=self.num_total_experts)
-            self.w2s = RowParallelLinear(self.intermediate_size,
+                                    quant_config=quant_config)
+            self.w2s = ReplicatedLinear(divide(self.intermediate_size, self.tp_size),
                                     self.d_model,
                                     bias=False,
-                                    quant_config=quant_config,
-                                    num_experts=self.num_total_experts)
+                                    quant_config=quant_config)
+            self.ws.quant_method.create_moe_weights(layer=self.ws, 
+                                                    input_size_per_partition=self.d_model, 
+                                                    output_partition_sizes=[divide(self.intermediate_size * 2, self.tp_size)],
+                                                    input_size=self.d_model,
+                                                    output_size=self.intermediate_size * 2,
+                                                    params_dtype=self.params_dtype,
+                                                    num_experts=self.num_total_experts,
+                                                    weight_loader=self.weight_loader)
+            self.w2s.quant_method.create_moe_weights(layer=self.w2s, 
+                                                    input_size_per_partition=divide(self.intermediate_size, self.tp_size), 
+                                                    output_partition_sizes=[self.d_model],
+                                                    input_size=self.intermediate_size,
+                                                    output_size=self.d_model,
+                                                    params_dtype=self.params_dtype,
+                                                    num_experts=self.num_total_experts,
+                                                    weight_loader=self.weight_loader)
         else:
             self.ws = nn.Parameter(
                 torch.empty(
@@ -138,9 +154,44 @@ class DbrxExperts(nn.Module):
             )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
-                      weight_name: str):
+                      weight_name: str, expert_id: int = -1, loaded_shard_id: int = None):
         tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
         param_data = param.data
+        if (expert_id != -1) and self.use_fused_gptq_moe:
+            param_data = param_data[expert_id]
+            if "w2" in weight_name:
+                input_dim = getattr(param, "input_dim", None)
+                if input_dim is not None:
+                    shard_size = param_data.shape[input_dim]
+                    start_idx = tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(input_dim, start_idx,
+                                                        shard_size)
+            if ("w1" in weight_name) or ("v1" in weight_name):
+                output_dim = getattr(param, "output_dim", None)
+                if output_dim is not None:
+                    shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
+                    shard_size = self.output_sizes[loaded_shard_id] // tp_size
+                    # Special case for quantization.
+                    # If quantized, we need to adjust the offset and size to account
+                    # for the packing.
+                    packed_dim = getattr(param, "packed_dim", None)
+                    if packed_dim == output_dim:
+                        shard_size = shard_size // param.pack_factor
+                        shard_offset = shard_offset // param.pack_factor
+                        # Special case for Marlin.
+                        shard_size, shard_offset = adjust_marlin_shard(
+                            param, shard_size, shard_offset)
+
+                    param_data = param_data.narrow(output_dim, shard_offset,
+                                                shard_size)
+                    start_idx = tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(output_dim, start_idx,
+                                                        shard_size)
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
+            return
+
         shard_size = self.intermediate_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         # DBRX uses GLU for each experts.
@@ -496,13 +547,11 @@ class DbrxForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    if shard_id is None:
-                        weight_loader(param, loaded_weight, expert_id=expert_id)
-                    else:
-                        weight_loader(param,
+                    weight_loader(param,
                                     loaded_weight,
-                                    shard_id,
-                                    expert_id=expert_id)
+                                    weight_name=weight_name,
+                                    expert_id=expert_id,
+                                    loaded_shard_id=shard_id)
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
