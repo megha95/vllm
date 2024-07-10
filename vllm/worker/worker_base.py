@@ -10,7 +10,7 @@ from vllm.distributed import broadcast_tensor_dict, get_pp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
-                           SamplerOutput)
+                           SamplerOutput, SequenceGroupMetadata)
 from vllm.utils import (enable_trace_function_call_for_thread, is_hip,
                         update_environment_variables)
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
@@ -171,6 +171,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     """
     is_driver_worker: bool
     model_runner: ModelRunnerBase
+    # NOTE: set this from engineArgs
+    async_process_outputs: bool = True
 
     @property
     @abstractmethod
@@ -211,6 +213,29 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         Process an execution request.
         """
         raise NotImplementedError
+
+    def _advance_to_next_step(
+        self,
+        output: List[SamplerOutput],
+        seq_group_metadata_list: List[SequenceGroupMetadata]) -> None:
+        """Given model output from a single run, append the tokens to the
+        sequences. This is normally done outside of the worker, but it is
+        required if the worker is to perform async forward passes to next step.
+        """
+        for seq_group_metadata, sequence_group_outputs in zip(
+                seq_group_metadata_list, output):
+            seq_group_metadata.is_prompt = False
+
+            for seq_output in sequence_group_outputs.samples:
+                # NOTE: Beam search is not supported, so we can assume that
+                # parent_seq_id == seq_id.
+                seq = seq_group_metadata.seq_data[seq_output.parent_seq_id]
+
+                token_id = seq_output.output_token
+                token_logprob = seq_output.logprobs[token_id]
+
+                seq.update_num_computed_tokens(seq_group_metadata.token_chunk_size)
+                seq.append_token_id(token_id, token_logprob.logprob)
 
     def execute_model(
         self,
@@ -272,6 +297,9 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             model_input, self.kv_cache[worker_input.virtual_engine]
             if self.kv_cache is not None else None, intermediate_tensors,
             num_steps)
+
+        if (self.async_process_outputs) and (len(output) > 0):
+            self._advance_to_next_step(output[0].outputs, execute_model_req.seq_group_metadata_list)
 
         if not get_pp_group().is_last_rank:
             get_pp_group().send_tensor_dict(output.tensors)

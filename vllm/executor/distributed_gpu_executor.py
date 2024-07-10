@@ -63,7 +63,7 @@ class DistributedGPUExecutor(GPUExecutor):
                           num_gpu_blocks=num_gpu_blocks,
                           num_cpu_blocks=num_cpu_blocks)
 
-    def execute_model(
+    async def execute_model(
         self, execute_model_req: ExecuteModelRequest
     ) -> Optional[List[SamplerOutput]]:
         if self.parallel_worker_tasks is None:

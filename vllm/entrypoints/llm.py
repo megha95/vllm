@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import get_cached_tokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, deprecate_kwargs
+import asyncio
 
 logger = init_logger(__name__)
 
@@ -558,7 +559,7 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs = asyncio.run(self.llm_engine.step())
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

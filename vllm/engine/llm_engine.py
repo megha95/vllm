@@ -42,6 +42,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter
 from vllm.version import __version__ as VLLM_VERSION
+import asyncio
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -342,6 +343,10 @@ class LLMEngine:
                     self.get_tokenizer_for_seq,
                 ),
             ))
+
+        self.previous_output = None
+        self.previous_scheduler_outputs = None
+        self.previous_seq_group_metadata_list = None
 
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
@@ -738,20 +743,24 @@ class LLMEngine:
 
         return
 
-    def _process_model_outputs(
+    async def _process_model_outputs(
         self,
         output: GenericSequence[Union[SamplerOutput, PoolerOutput]],
-        scheduled_seq_groups: List[ScheduledSequenceGroup],
-        ignored_seq_groups: List[SequenceGroup],
+        scheduler_outputs: SchedulerOutputs, #List[ScheduledSequenceGroup],
+        # ignored_seq_groups: List[SequenceGroup],
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Apply the model output to the sequences in the scheduled seq groups.
 
         Returns RequestOutputs that can be returned to the client.
         """
+        if output is None:
+            return None
+        scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+        ignored_seq_groups = scheduler_outputs.ignored_seq_groups
 
         now = time.time()
-
+        
         # Organize outputs by [sequence group][step] instead of
         # [step][sequence group].
         output_by_sequence_group = create_output_by_sequence_group(
@@ -762,8 +771,8 @@ class LLMEngine:
                 scheduled_seq_groups, output_by_sequence_group,
                 seq_group_metadata_list):
             seq_group = scheduled_seq_group.seq_group
-            seq_group.update_num_computed_tokens(
-                scheduled_seq_group.token_chunk_size)
+            # seq_group.update_num_computed_tokens(
+            #     scheduled_seq_group.token_chunk_size)
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, outputs)
                 continue
@@ -789,7 +798,7 @@ class LLMEngine:
             request_outputs.append(request_output)
         return request_outputs
 
-    def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
+    async def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -849,6 +858,16 @@ class LLMEngine:
         finished_requests_ids = self.scheduler[
             0].get_and_reset_finished_requests_ids()
 
+        # loop = asyncio.new_event_loop()
+        # loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
+        # asyncio.set_event_loop(loop)
+        # loop.create_task(self._process_model_outputs(
+        #     self.previous_output, self.previous_scheduler_outputs, 
+        #     self.previous_seq_group_metadata_list))
+        request_outputs = asyncio.create_task(self._process_model_outputs(
+            self.previous_output, self.previous_scheduler_outputs, 
+            self.previous_seq_group_metadata_list))
+
         if not scheduler_outputs.is_empty():
             execute_model_req = ExecuteModelRequest(
                 seq_group_metadata_list=seq_group_metadata_list,
@@ -858,20 +877,21 @@ class LLMEngine:
                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
                 running_queue_size=scheduler_outputs.running_queue_size,
                 finished_requests_ids=finished_requests_ids)
-            output = self.model_executor.execute_model(
-                execute_model_req=execute_model_req)
+            output = asyncio.create_task(self.model_executor.execute_model(
+                execute_model_req=execute_model_req))
         else:
             output = []
-
-        request_outputs = self._process_model_outputs(
-            output, scheduler_outputs.scheduled_seq_groups,
-            scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+        
+        output, request_outputs = await asyncio.gather(*[output, request_outputs])
+        self.previous_output = output
+        self.previous_scheduler_outputs = scheduler_outputs
+        self.previous_seq_group_metadata_list = seq_group_metadata_list
 
         # Log stats.
-        self.do_log_stats(scheduler_outputs, output)
+        # self.do_log_stats(scheduler_outputs, output)
 
         # Tracing
-        self.do_tracing(scheduler_outputs)
+        # self.do_tracing(scheduler_outputs)
 
         if not self.has_unfinished_requests():
             # Stop the execute model loop in parallel workers until there are
@@ -881,7 +901,7 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             self.model_executor.stop_remote_worker_execution_loop()
 
-        return request_outputs
+        return request_outputs if request_outputs is not None else []
 
     def add_logger(self, logger_name: str, logger: StatLoggerBase) -> None:
         if logger_name in self.stat_loggers:
