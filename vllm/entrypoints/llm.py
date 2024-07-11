@@ -576,6 +576,11 @@ class LLM:
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
+
+        step_outputs = asyncio.run(self.llm_engine._process_model_outputs())
+        for output in step_outputs:
+            if output.finished:
+                outputs.append(output)
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.

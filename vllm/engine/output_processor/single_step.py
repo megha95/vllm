@@ -81,7 +81,11 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
             for parent_seq in parent_seqs
         }
         for sample in samples:
-            parent_child_dict[sample.parent_seq_id].append(sample)
+            # TO DO[megha]: this is hacky, think of something better
+            try:
+                parent_child_dict[sample.parent_seq_id].append(sample)
+            except:
+                pass
         # List of (child, parent)
         child_seqs: List[Tuple[Sequence, Sequence]] = []
 

@@ -743,22 +743,17 @@ class LLMEngine:
 
         return
 
-    async def _process_model_outputs(
-        self,
-        output: GenericSequence[Union[SamplerOutput, PoolerOutput]],
-        scheduler_outputs: SchedulerOutputs, #List[ScheduledSequenceGroup],
-        # ignored_seq_groups: List[SequenceGroup],
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
+    async def _process_model_outputs(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Apply the model output to the sequences in the scheduled seq groups.
 
         Returns RequestOutputs that can be returned to the client.
         """
+        output = self.previous_output
         if output is None:
             return None
-        scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
-        ignored_seq_groups = scheduler_outputs.ignored_seq_groups
-
+        scheduled_seq_groups = self.previous_scheduler_outputs.scheduled_seq_groups
+        ignored_seq_groups = self.previous_scheduler_outputs.ignored_seq_groups
+        seq_group_metadata_list = self.previous_seq_group_metadata_list
         now = time.time()
         
         # Organize outputs by [sequence group][step] instead of
@@ -771,8 +766,6 @@ class LLMEngine:
                 scheduled_seq_groups, output_by_sequence_group,
                 seq_group_metadata_list):
             seq_group = scheduled_seq_group.seq_group
-            # seq_group.update_num_computed_tokens(
-            #     scheduled_seq_group.token_chunk_size)
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, outputs)
                 continue
@@ -858,15 +851,7 @@ class LLMEngine:
         finished_requests_ids = self.scheduler[
             0].get_and_reset_finished_requests_ids()
 
-        # loop = asyncio.new_event_loop()
-        # loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
-        # asyncio.set_event_loop(loop)
-        # loop.create_task(self._process_model_outputs(
-        #     self.previous_output, self.previous_scheduler_outputs, 
-        #     self.previous_seq_group_metadata_list))
-        request_outputs = asyncio.create_task(self._process_model_outputs(
-            self.previous_output, self.previous_scheduler_outputs, 
-            self.previous_seq_group_metadata_list))
+        request_outputs = asyncio.create_task(self._process_model_outputs())
 
         if not scheduler_outputs.is_empty():
             execute_model_req = ExecuteModelRequest(
@@ -888,10 +873,10 @@ class LLMEngine:
         self.previous_seq_group_metadata_list = seq_group_metadata_list
 
         # Log stats.
-        # self.do_log_stats(scheduler_outputs, output)
+        self.do_log_stats(scheduler_outputs, output)
 
         # Tracing
-        # self.do_tracing(scheduler_outputs)
+        self.do_tracing(scheduler_outputs)
 
         if not self.has_unfinished_requests():
             # Stop the execute model loop in parallel workers until there are
